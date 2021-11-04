@@ -2,25 +2,19 @@ import os
 import arcpy
 import pandas as pd
 
-def getHullPoints(poly):
-    #Check accuracy difference using something other than hullrectangle
-    #Different with hullrectangle for alpha was a maximum of 20m - FROM and TO
-    hull = poly.hullRectangle
-    spt = hull.split()
-    pts = []
-    print(hull)
-    for i in range(0,len(spt)-1,2):
-        x = spt[i]
-        y = spt[i+1]
-        pts.append(arcpy.Point(x,y))
-    return pts
-
 def lrPolyPoints(inPolys,centerline,outLoc):
+    """
+    -Takes a polygon, gets the vertices of the polygon (points)
+     references those points to a centerline that is also provided
+    -Returns the path to a CSV file that is the linear location of those points referenced to the provided centerline
+        - The POLY_ID field is used to then join the points back to the polygon that they were derived from using the other functions.
+    """
     sr = arcpy.Describe(inPolys).spatialReference
+    getPolyPts = lambda poly: [pt for part in poly for pt in part]
     getPts = []
     with arcpy.da.SearchCursor(inPolys,["OID@","SHAPE@"]) as sc:
         for row in sc:
-            oid, hrPts = row[0], getHullPoints(row[1])
+            oid, hrPts = row[0], getPolyPts(row[1])
             for hp in hrPts:
                 getPts.append([oid,hp])
     arcpy.management.CreateFeatureclass("in_memory","POLY_PTS","POINT",spatial_reference=sr)
@@ -33,39 +27,48 @@ def lrPolyPoints(inPolys,centerline,outLoc):
     arcpy.LocateFeaturesAlongRoutes_lr(in_features=r"in_memory/POLY_PTS",
                                        in_routes=centerline,
                                        route_id_field=clID,
-                                       radius_or_tolerance="500 meters",
+                                       radius_or_tolerance="2000 meters",
                                        out_table=os.path.join(outLoc,"POLY_PTS.csv"))
     return os.path.join(outLoc,"POLY_PTS.csv")
 
+def procCSV(csv_path):
+    """
+    Processes the CSV file created by lrPolyPoints
+        - Adds the FROM and TO fields and groups by the polygon id
+        - Returns a dictionary containing the TO and FROM with the ObjectID/Polygon ID as the key and the FROM/TO values as values
+    """
+    df = pd.read_csv(csv_path)
+    df["PYT_FROM"] = df["MEAS"]
+    df["PYT_TO"]   = df["MEAS"]
+    gb = df.groupby("POLY_ID").agg({"PYT_FROM":min,"PYT_TO":max})
+    kpDict = gb.to_dict("index")
+    return kpDict
 
-    
 if __name__ == "__main__":
     arcpy.env.overwriteOutput = True
     inPolys = arcpy.GetParameterAsText(0)
     polyFields = [f.name for f in arcpy.ListFields(inPolys)]
+    arcpy.AddMessage(polyFields)
     centerline = arcpy.GetParameterAsText(1)
     outLoc = arcpy.GetParameterAsText(2)
     
     csvData = lrPolyPoints(inPolys,centerline,outLoc)
-    df = pd.read_csv(csvData)
-    df["FROM_KP"] = df["MEAS"]
-    df["TO_KP"]   = df["MEAS"]
-    gb = df.groupby("POLY_ID").agg({"FROM_KP":min,"TO_KP":max})
-    kpDict = gb.to_dict("index")
+    kpDict = procCSV(csvData)
     
-    kpFields =  [{"field_name":"FROM_KP","field_type":"DOUBLE"},
-                 {"field_name":"TO_KP","field_type":"DOUBLE"}]
+    kpFields =  [{"field_name":"PYT_FROM","field_type":"DOUBLE"},
+                 {"field_name":"PYT_TO","field_type":"DOUBLE"}]
     
     for f in kpFields:
         if f["field_name"] not in polyFields:
             arcpy.management.AddField(inPolys,f["field_name"],f["field_type"])
     
-    with arcpy.da.UpdateCursor(inPolys,["OID@","FROM_KP","TO_KP"]) as uc:
+    with arcpy.da.UpdateCursor(inPolys,["OID@","PYT_FROM","PYT_TO"]) as uc:
         for row in uc:
+            arcpy.AddMessage("UPDATING ROW")
             oid = row[0]
             if oid in kpDict:
-                row[1] = kpDict[oid]["FROM_KP"]
-                row[2] = kpDict[oid]["TO_KP"]
+                row[1] = kpDict[oid]["PYT_FROM"]
+                row[2] = kpDict[oid]["PYT_TO"]
                 uc.updateRow(row)
 
     arcpy.Delete_management(r"in_memory\POLY_PTS")
